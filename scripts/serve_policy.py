@@ -51,6 +51,11 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
+    # Override the model's action_horizon (chunk length). The flow-matching head
+    # has no horizon-sized parameters, so the checkpoint loads at any value, but
+    # values above the trained horizon (10 for pi05_libero) are extrapolation.
+    action_horizon: int | None = None
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -76,11 +81,22 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+def _maybe_override_horizon(train_config, action_horizon: int | None):
+    if action_horizon is None:
+        return train_config
+    logging.info("Overriding action_horizon: %d -> %d",
+                 train_config.model.action_horizon, action_horizon)
+    return dataclasses.replace(
+        train_config, model=dataclasses.replace(train_config.model, action_horizon=action_horizon))
+
+
+def create_default_policy(env: EnvMode, *, default_prompt: str | None = None,
+                          action_horizon: int | None = None) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            _maybe_override_horizon(_config.get_config(checkpoint.config), action_horizon),
+            checkpoint.dir, default_prompt=default_prompt
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
@@ -90,10 +106,12 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _maybe_override_horizon(_config.get_config(args.policy.config), args.action_horizon),
+                args.policy.dir, default_prompt=args.default_prompt
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(args.env, default_prompt=args.default_prompt,
+                                         action_horizon=args.action_horizon)
 
 
 def main(args: Args) -> None:
