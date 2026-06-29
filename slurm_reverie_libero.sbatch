@@ -113,7 +113,7 @@ MAX_TASKS_ARG=""
 [[ -n "$MAX_TASKS" ]] && MAX_TASKS_ARG="--max-tasks $MAX_TASKS"
 REPLAN_ARG=""
 [[ -n "$REPLAN_STEPS" ]] && REPLAN_ARG="--replan-steps $REPLAN_STEPS"
-VIDEO_OUT="data/libero/videos_reverie/${MODE}_N${REVERIE_N}_r${REPLAN_STEPS:-d}_h${ACTION_HORIZON:-d}"
+VIDEO_OUT="data/libero/videos_reverie/${MODE}_N${REVERIE_N}_r${REPLAN_STEPS:-d}_h${ACTION_HORIZON:-d}_job${SLURM_JOB_ID}"
 eval MUJOCO_EGL_DEVICE_ID=$G_SIM ./run_libero_eval.sh reverie-sim \
   --host 127.0.0.1 --port "$POLICY_PORT" \
   --task-suite-name "$TASK_SUITE" \
