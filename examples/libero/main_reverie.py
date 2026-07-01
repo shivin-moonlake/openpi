@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import json
 import logging
 import math
 import pathlib
@@ -61,6 +62,11 @@ class Args:
     )
     reverie_mode: str = "autoregressive_independent"
     reverie_seed: int = 123
+    # Optional JSON prompt bank (isaaclab_templates.json style: keys env/robot/
+    # table/light, each a list of fragments). When set, a fresh prompt is
+    # composed per task by sampling one fragment from each of these categories.
+    prompt_templates: Optional[str] = None
+    prompt_template_keys: str = "env,robot,table,light"
     # Letterbox square sim frames to the server's inference aspect ratio
     # (edge-pad before sending, crop center back) so the 256->1280 stretch
     # doesn't distort the scene.
@@ -121,11 +127,25 @@ def eval_libero(args: Args) -> None:
 
     chunked = args.mode in ("rerender", "raw_chunked")
 
+    prompt_bank = None
+    if args.prompt_templates:
+        prompt_bank = json.loads(pathlib.Path(args.prompt_templates).read_text())
+    prompt_rng = np.random.default_rng(args.seed)
+    template_keys = [k.strip() for k in args.prompt_template_keys.split(",") if k.strip()]
+
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+
+        # Compose a fresh reverie style prompt per task (same across its episodes).
+        if prompt_bank is not None:
+            reverie_prompt = " ".join(
+                str(prompt_rng.choice(prompt_bank[k])) for k in template_keys)
+            logging.info("Reverie prompt [task %d]: %s", task_id, reverie_prompt)
+        else:
+            reverie_prompt = args.reverie_prompt
 
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
@@ -135,7 +155,7 @@ def eval_libero(args: Args) -> None:
             action_plan = collections.deque()
 
             if reverie is not None:
-                reverie.open_session(args.reverie_prompt, mode=args.reverie_mode,
+                reverie.open_session(reverie_prompt, mode=args.reverie_mode,
                                      seed=args.reverie_seed, force=True)
 
             # Perception buffers (chunked modes).
@@ -150,12 +170,30 @@ def eval_libero(args: Args) -> None:
 
             t, done = 0, False
             logging.info("Starting episode %d...", task_episodes + 1)
-            while t < max_steps + args.num_steps_wait:
-                if t < args.num_steps_wait:
-                    obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
-                    t += 1
-                    continue
 
+            # Warmup: let physics settle and, in chunked modes, prime the
+            # perception buffer with dummy-action steps so the policy's first
+            # real observation is already a (re)rendered frame -- the policy
+            # never acts on a raw sim frame during the first chunk.
+            while t < args.num_steps_wait or (chunked and last_img is None):
+                agent = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                if chunked:
+                    buf_agent.append(agent)
+                    buf_wrist.append(wrist)
+                    if len(buf_agent) == next_chunk:
+                        out_agent, out_wrist = _rerender_chunk(
+                            reverie, buf_agent, buf_wrist, aspect)
+                        if args.save_reverie_video:
+                            reverie_view.extend(out_agent)
+                        last_img = _resize224(out_agent[-1], args.resize_size)
+                        last_wrist = _resize224(out_wrist[-1], args.resize_size)
+                        buf_agent, buf_wrist = [], []
+                        next_chunk = later_chunk
+                obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                t += 1
+
+            while t < max_steps + args.num_steps_wait:
                 # Upright native-res frames (180deg rotate matches train preproc).
                 agent = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
                 wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
@@ -179,7 +217,7 @@ def eval_libero(args: Args) -> None:
                 if last_img is not None:
                     img224, wrist224 = last_img, last_wrist
                 else:
-                    # Warmup before the first chunk flush (or vanilla mode).
+                    # Only reached in vanilla (non-chunked) mode.
                     img224 = _resize224(agent, args.resize_size)
                     wrist224 = _resize224(wrist, args.resize_size)
 

@@ -18,6 +18,22 @@ deactivate_venv() {
   unset VIRTUAL_ENV
 }
 
+# Path to a glvnd EGL vendor JSON that selects NVIDIA's surfaceless EGL (so
+# MuJoCo renders on the GPU via /dev/nvidia* and never touches /dev/dri, which
+# is what fails with "Permission denied" on headless nodes). Some nodes ship
+# /usr/share/glvnd/egl_vendor.d/10_nvidia.json; others only have 50_mesa.json,
+# in which case glvnd would pick Mesa and EGL init fails. Fall back to a
+# repo-bundled JSON (references libEGL_nvidia.so.0 by soname) so it works
+# regardless of the node image.
+nvidia_egl_vendor_json() {
+  local sys="/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+  if [[ -f "$sys" ]]; then
+    echo "$sys"
+  else
+    echo "$OPENPI_ROOT/examples/libero/egl/10_nvidia.json"
+  fi
+}
+
 if [[ ! -f "$HOME/.libero/config.yaml" ]]; then
   echo "Creating ~/.libero/config.yaml ..."
   mkdir -p "$HOME/.libero"
@@ -74,8 +90,7 @@ case "${1:-}" in
     export PYTHONPATH="${PYTHONPATH:-}:$OPENPI_ROOT/third_party/libero"
     export MUJOCO_GL="${MUJOCO_GL:-egl}"
     if [[ "$MUJOCO_GL" == "egl" ]]; then
-      nvidia_egl="/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
-      [[ -f "$nvidia_egl" ]] && export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-$nvidia_egl}"
+      export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-$(nvidia_egl_vendor_json)}"
       export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
       export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
     fi
@@ -90,10 +105,7 @@ case "${1:-}" in
     if [[ "$MUJOCO_GL" == "egl" ]]; then
       # Prefer NVIDIA's surfaceless EGL vendor so rendering does not depend on
       # /dev/dri render-node permissions (the usual headless failure mode).
-      nvidia_egl="/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
-      if [[ -f "$nvidia_egl" ]]; then
-        export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-$nvidia_egl}"
-      fi
+      export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-$(nvidia_egl_vendor_json)}"
       export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
       export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
     elif [[ "$MUJOCO_GL" == "osmesa" ]]; then

@@ -12,7 +12,14 @@
 #
 #SBATCH --job-name=reverie-libero
 #SBATCH --output=reverie-libero-%j.log
+# All three services (reverie server, policy server, LIBERO sim) run on the
+# batch host and talk over localhost; the sim's EGL/CUDA device ids come from
+# this host's CUDA_VISIBLE_DEVICES. --nodes=1 pins all 3 GPUs to one node so
+# those indices are valid locally (without it Slurm may spread GPUs across
+# nodes, and MuJoCo EGL falls through to an inaccessible Mesa DRI device).
+#SBATCH --nodes=1
 #SBATCH --gpus=3
+#SBATCH --gpus-per-node=3
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
 #SBATCH --time=02:00:00
@@ -28,12 +35,16 @@ OPENPI_ROOT="$REVERIE_ROOT/openpi"
 # Tunables (override via: sbatch --export=ALL,MODE=raw_chunked,... )
 MODE="${MODE:-rerender}"                       # rerender | raw_chunked | vanilla
 REVERIE_N="${REVERIE_N:-3}"                     # 3 (chunks 9->12) | 1 (chunks 1->4, tighter loop)
+REVERIE_MODEL="${REVERIE_MODEL:-sf}"           # sf (SF_independent N=3) | n18_distill_run1 (two-step DMD distill) | dualdmd
 REPLAN_STEPS="${REPLAN_STEPS:-}"               # blank -> sim default (5)
 ACTION_HORIZON="${ACTION_HORIZON:-}"           # blank -> model default (10 for pi05_libero)
 TASK_SUITE="${TASK_SUITE:-libero_spatial}"
 NUM_TRIALS="${NUM_TRIALS:-2}"                   # per task; raise for full runs
 MAX_TASKS="${MAX_TASKS:-1}"                     # cap tasks for a quick test
 REVERIE_PROMPT="${REVERIE_PROMPT:-A robotic arm with segmented joints and a gripper moves above a tabletop workspace on a bright sunny day, with warm sunlight casting soft highlights and long shadows.}"
+# Optional JSON prompt bank (env/robot/table/light fragments) -> a fresh
+# composed prompt is sampled per task. Blank uses the single REVERIE_PROMPT.
+PROMPT_TEMPLATES="${PROMPT_TEMPLATES:-}"
 
 # Per-job ports so concurrent jobs on the same node don't collide.
 POLICY_PORT=$(( 8000 + (SLURM_JOB_ID % 1000) ))
@@ -77,11 +88,17 @@ PIDS+=($!)
 # N=3 is the trained ARI recipe; other N run in plain 'independent' mode.
 # Pixel-frame counts (4x temporal VAE): first = 1+4*(N-1), later = 4*N.
 if [[ "$REVERIE_N" == "3" ]]; then
-  REVERIE_CONFIG="$REVERIE_ROOT/integration/simpler/config.shivin.yaml"
   REVERIE_STREAM_MODE="autoregressive_independent"
 else
-  REVERIE_CONFIG="$REVERIE_ROOT/integration/simpler/config.shivin.N${REVERIE_N}.yaml"
   REVERIE_STREAM_MODE="independent"
+fi
+if [[ "$REVERIE_MODEL" != "sf" ]]; then
+  # n18_distill_run1 | dualdmd | ... -> config.shivin.<model>.N<N>.yaml
+  REVERIE_CONFIG="$REVERIE_ROOT/integration/simpler/config.shivin.${REVERIE_MODEL}.N${REVERIE_N}.yaml"
+elif [[ "$REVERIE_N" == "3" ]]; then
+  REVERIE_CONFIG="$REVERIE_ROOT/integration/simpler/config.shivin.yaml"
+else
+  REVERIE_CONFIG="$REVERIE_ROOT/integration/simpler/config.shivin.N${REVERIE_N}.yaml"
 fi
 FIRST_CHUNK=$(( 1 + 4 * (REVERIE_N - 1) ))
 LATER_CHUNK=$(( 4 * REVERIE_N ))
@@ -98,6 +115,7 @@ if [[ "$MODE" == "rerender" ]]; then
   PIDS+=($!)
   wait_for_port 127.0.0.1 "$REVERIE_PORT" 900
   REVERIE_ARGS="--mode rerender --reverie-host 127.0.0.1 --reverie-port $REVERIE_PORT --reverie-mode $REVERIE_STREAM_MODE --reverie-prompt \"$REVERIE_PROMPT\""
+  [[ -n "$PROMPT_TEMPLATES" ]] && REVERIE_ARGS="$REVERIE_ARGS --prompt-templates \"$PROMPT_TEMPLATES\""
 elif [[ "$MODE" == "raw_chunked" ]]; then
   REVERIE_ARGS="--mode raw_chunked --first-chunk $FIRST_CHUNK --later-chunk $LATER_CHUNK"
 else
@@ -113,7 +131,7 @@ MAX_TASKS_ARG=""
 [[ -n "$MAX_TASKS" ]] && MAX_TASKS_ARG="--max-tasks $MAX_TASKS"
 REPLAN_ARG=""
 [[ -n "$REPLAN_STEPS" ]] && REPLAN_ARG="--replan-steps $REPLAN_STEPS"
-VIDEO_OUT="data/libero/videos_reverie/${MODE}_N${REVERIE_N}_r${REPLAN_STEPS:-d}_h${ACTION_HORIZON:-d}_job${SLURM_JOB_ID}"
+VIDEO_OUT="data/libero/videos_reverie/${MODE}_${REVERIE_MODEL}_N${REVERIE_N}_r${REPLAN_STEPS:-d}_h${ACTION_HORIZON:-d}_job${SLURM_JOB_ID}"
 eval MUJOCO_EGL_DEVICE_ID=$G_SIM ./run_libero_eval.sh reverie-sim \
   --host 127.0.0.1 --port "$POLICY_PORT" \
   --task-suite-name "$TASK_SUITE" \
