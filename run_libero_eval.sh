@@ -96,6 +96,20 @@ case "${1:-}" in
     fi
     exec "$LIBERO_PYTHON" examples/libero/main_reverie.py "$@"
     ;;
+  export-gbuffers)
+    # Export a LIBERO episode as a Reverie-standard gbuffer recording (no Reverie).
+    shift
+    deactivate_venv
+    setup_libero_venv
+    export PYTHONPATH="${PYTHONPATH:-}:$OPENPI_ROOT/third_party/libero"
+    export MUJOCO_GL="${MUJOCO_GL:-egl}"
+    if [[ "$MUJOCO_GL" == "egl" ]]; then
+      export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-$(nvidia_egl_vendor_json)}"
+      export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
+      export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
+    fi
+    exec "$LIBERO_PYTHON" examples/libero/export_gbuffers.py "$@"
+    ;;
   sim)
     shift
     deactivate_venv
