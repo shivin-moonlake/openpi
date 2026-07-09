@@ -22,7 +22,7 @@
 #SBATCH --gpus-per-node=3
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
-#SBATCH --time=02:00:00
+#SBATCH --time=08:00:00
 set -euo pipefail
 
 # Use a writable uv cache; the submitting shell may export a sandbox UV_CACHE_DIR
@@ -113,7 +113,7 @@ if [[ "$MODE" == "rerender" ]]; then
          uv run --no-sync python integration/simpler/server.py ) \
     > "$OPENPI_ROOT/reverie_server-$SLURM_JOB_ID.log" 2>&1 &
   PIDS+=($!)
-  wait_for_port 127.0.0.1 "$REVERIE_PORT" 900
+  wait_for_port 127.0.0.1 "$REVERIE_PORT" 1800  # 40GB load + float8/flash4 compile + warmup
   REVERIE_ARGS="--mode rerender --reverie-host 127.0.0.1 --reverie-port $REVERIE_PORT --reverie-mode $REVERIE_STREAM_MODE --reverie-prompt \"$REVERIE_PROMPT\""
   [[ -n "$PROMPT_TEMPLATES" ]] && REVERIE_ARGS="$REVERIE_ARGS --prompt-templates \"$PROMPT_TEMPLATES\""
 elif [[ "$MODE" == "raw_chunked" ]]; then
