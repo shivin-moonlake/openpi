@@ -108,6 +108,7 @@ if [[ "$MODE" == "rerender" ]]; then
   echo "=== Starting Reverie server (GPU$G_REVERIE, :$REVERIE_PORT, N=$REVERIE_N) ==="
   ( cd "$REVERIE_ROOT" \
       && CUDA_VISIBLE_DEVICES=$G_REVERIE \
+         PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
          REVERIE_SIMPLER_CONFIG="$REVERIE_CONFIG" \
          REVERIE_SIMPLER_PORT="$REVERIE_PORT" \
          uv run --no-sync python integration/simpler/server.py ) \
