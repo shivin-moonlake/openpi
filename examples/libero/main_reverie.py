@@ -12,7 +12,8 @@ frame on demand. We therefore decouple perception from control:
     <= chunk_frames old) image, with always-fresh proprioceptive state.
 
 Modes (``--mode``):
-  rerender    - both cameras streamed through Reverie (needs --reverie-host).
+  rerender    - both cameras streamed through the shared Reverie stream
+                server (--reverie-url, /api WebSocket endpoint).
   raw_chunked - identical buffering/staleness, Reverie bypassed (A/B baseline).
   vanilla     - original per-step loop (no chunking), for reference.
 """
@@ -50,10 +51,13 @@ class Args:
     resize_size: int = 224
     replan_steps: int = 5
 
-    # Reverie rerender server (integration/simpler/server.py)
+    # Shared Reverie stream server (inference/stream/local_stream_server.py,
+    # /api endpoint). Connecting leases one GPU for the whole eval.
     mode: Literal["rerender", "raw_chunked", "vanilla"] = "rerender"
-    reverie_host: Optional[str] = None
-    reverie_port: int = 8418
+    reverie_url: str = "ws://gmicloud-loki-g1-gpu-001:8422/api"
+    # Optional config preset/YAML to load on the leased GPU (blank = whatever
+    # the server has resident, default dual_dmd_cf_optimized).
+    reverie_config: str = ""
     reverie_prompt: str = (
         "A robotic arm with segmented joints and a gripper moves above a tabletop "
         "workspace on a bright sunny day, with warm sunlight pouring in and casting "
@@ -63,10 +67,13 @@ class Args:
     reverie_mode: str = "autoregressive_independent"
     reverie_seed: int = 123
     # Optional JSON prompt bank (isaaclab_templates.json style: keys env/robot/
-    # table/light, each a list of fragments). When set, a fresh prompt is
-    # composed per task by sampling one fragment from each of these categories.
+    # table/light, each a list of fragments). When set, num_reverie_prompts
+    # prompts are composed once (one fragment per category each) and cycled
+    # across every task's episodes: episode e uses prompt e % num, so 50
+    # trials cover 10 prompts 5x each.
     prompt_templates: Optional[str] = None
     prompt_template_keys: str = "env,robot,table,light"
+    num_reverie_prompts: int = 10
     # Letterbox square sim frames to the server's inference aspect ratio
     # (edge-pad before sending, crop center back) so the 256->1280 stretch
     # doesn't distort the scene.
@@ -93,8 +100,8 @@ def _resize224(frame_u8: np.ndarray, size: int) -> np.ndarray:
 def eval_libero(args: Args) -> None:
     np.random.seed(args.seed)
 
-    if args.mode == "rerender" and not args.reverie_host:
-        raise ValueError("--reverie-host is required for mode=rerender")
+    if args.mode == "rerender" and not args.reverie_url:
+        raise ValueError("--reverie-url is required for mode=rerender")
 
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
@@ -116,7 +123,7 @@ def eval_libero(args: Args) -> None:
     first_chunk, later_chunk = args.first_chunk, args.later_chunk
     aspect = None  # inference width/height; enables letterboxing when set
     if args.mode == "rerender":
-        reverie = ReverieClient(args.reverie_host, args.reverie_port)
+        reverie = ReverieClient(args.reverie_url, config=args.reverie_config)
         info = reverie.info()
         first_chunk, later_chunk = info["first_chunk_frames"], info["chunk_frames"]
         if args.pad_aspect:
@@ -127,11 +134,19 @@ def eval_libero(args: Args) -> None:
 
     chunked = args.mode in ("rerender", "raw_chunked")
 
-    prompt_bank = None
+    # One fixed set of composed reverie prompts, shared by all tasks and
+    # cycled across each task's episodes (episode e -> prompt e % num).
+    reverie_prompts = [args.reverie_prompt]
     if args.prompt_templates:
         prompt_bank = json.loads(pathlib.Path(args.prompt_templates).read_text())
-    prompt_rng = np.random.default_rng(args.seed)
-    template_keys = [k.strip() for k in args.prompt_template_keys.split(",") if k.strip()]
+        prompt_rng = np.random.default_rng(args.seed)
+        template_keys = [k.strip() for k in args.prompt_template_keys.split(",") if k.strip()]
+        reverie_prompts = [
+            " ".join(str(prompt_rng.choice(prompt_bank[k])) for k in template_keys)
+            for _ in range(args.num_reverie_prompts)
+        ]
+        for i, p in enumerate(reverie_prompts):
+            logging.info("Reverie prompt %d: %s", i, p)
 
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
@@ -139,24 +154,19 @@ def eval_libero(args: Args) -> None:
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
 
-        # Compose a fresh reverie style prompt per task (same across its episodes).
-        if prompt_bank is not None:
-            reverie_prompt = " ".join(
-                str(prompt_rng.choice(prompt_bank[k])) for k in template_keys)
-            logging.info("Reverie prompt [task %d]: %s", task_id, reverie_prompt)
-        else:
-            reverie_prompt = args.reverie_prompt
-
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
+            reverie_prompt = reverie_prompts[episode_idx % len(reverie_prompts)]
             logging.info("\nTask: %s", task_description)
+            logging.info("Reverie prompt [task %d ep %d]: %s",
+                         task_id, episode_idx, reverie_prompt)
             env.reset()
             obs = env.set_init_state(initial_states[episode_idx])
             action_plan = collections.deque()
 
             if reverie is not None:
                 reverie.open_session(reverie_prompt, mode=args.reverie_mode,
-                                     seed=args.reverie_seed, force=True)
+                                     seed=args.reverie_seed)
 
             # Perception buffers (chunked modes).
             buf_agent: list = []
@@ -248,9 +258,6 @@ def eval_libero(args: Args) -> None:
                     break
                 t += 1
 
-            if reverie is not None:
-                reverie.close()
-
             task_episodes += 1
             total_episodes += 1
 
@@ -269,6 +276,9 @@ def eval_libero(args: Args) -> None:
                          total_successes / total_episodes * 100)
 
         logging.info("Task success rate: %.3f", task_successes / max(task_episodes, 1))
+
+    if reverie is not None:
+        reverie.close()
 
     logging.info("Total success rate: %.3f (%d episodes)",
                  total_successes / max(total_episodes, 1), total_episodes)
