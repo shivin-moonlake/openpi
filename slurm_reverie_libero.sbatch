@@ -88,13 +88,14 @@ echo "=== Starting openpi policy server (GPU$G_POLICY, :$POLICY_PORT) $SERVER_EX
 PIDS+=($!)
 
 # N selects chunk size (perception cadence) + stream mode; it must match the
-# N of the config loaded on the stream server. N=3 is the trained ARI recipe;
-# other N run in plain 'independent' mode. Pixel-frame counts (4x temporal
-# VAE): first = 1+4*(N-1), later = 4*N.
-if [[ "$REVERIE_N" == "3" ]]; then
-  REVERIE_STREAM_MODE="autoregressive_independent"
-else
+# N of the config loaded on the stream server (e.g. REVERIE_CONFIG=
+# dual_dmd_cf_optimized_N2 for N=2). The ARI recipe is N-generic; only N=1
+# (no intra-chunk context) falls back to plain 'independent'. Pixel-frame
+# counts (4x temporal VAE): first = 1+4*(N-1), later = 4*N.
+if [[ "$REVERIE_N" == "1" ]]; then
   REVERIE_STREAM_MODE="independent"
+else
+  REVERIE_STREAM_MODE="autoregressive_independent"
 fi
 FIRST_CHUNK=$(( 1 + 4 * (REVERIE_N - 1) ))
 LATER_CHUNK=$(( 4 * REVERIE_N ))
