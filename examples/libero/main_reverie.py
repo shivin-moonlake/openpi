@@ -2,14 +2,8 @@
 
 Same task as examples/libero/main.py, but the policy's camera observations are
 optionally re-rendered by the Reverie streaming server before being fed to
-pi0.5. Because Reverie is an autoregressive *temporal* model (4x temporal VAE:
-first chunk 1+4*(N-1) frames, later chunks 4*N), it cannot rerender a single
-frame on demand. We therefore decouple perception from control:
-
-  * raw sim frames are buffered into Reverie-sized chunks and flushed through
-    the server; the latest rerendered frame becomes the policy's visual input,
-  * the policy keeps replanning every ``replan_steps`` on that (possibly stale,
-    <= chunk_frames old) image, with always-fresh proprioceptive state.
+pi0.5. The chunked perception loop (buffering, staleness, aspect padding)
+lives in inference/stream/rerender_loop.py, shared with the YAM sims.
 
 Modes (``--mode``):
   rerender    - both cameras streamed through the shared Reverie stream
@@ -21,10 +15,10 @@ from __future__ import annotations
 
 import collections
 import dataclasses
-import json
 import logging
 import math
 import pathlib
+import sys
 from typing import Literal, Optional
 
 import imageio
@@ -37,7 +31,9 @@ from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
 
-from reverie_client import ReverieClient
+# reverie root (this file lives at reverie/openpi/examples/libero/).
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
+import inference.stream.rerender_loop as rerender_loop  # noqa: E402
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -66,11 +62,10 @@ class Args:
     )
     reverie_mode: str = "autoregressive_independent"
     reverie_seed: int = 123
-    # Optional JSON prompt bank (isaaclab_templates.json style: keys env/robot/
-    # table/light, each a list of fragments). When set, num_reverie_prompts
-    # prompts are composed once (one fragment per category each) and cycled
-    # across every task's episodes: episode e uses prompt e % num, so 50
-    # trials cover 10 prompts 5x each.
+    # Optional JSON prompt bank (isaaclab_templates.json style). When set,
+    # num_reverie_prompts prompts are composed once and cycled across every
+    # task's episodes: episode e uses prompt e % num, so 50 trials cover 10
+    # prompts 5x each.
     prompt_templates: Optional[str] = None
     prompt_template_keys: str = "env,robot,table,light"
     num_reverie_prompts: int = 10
@@ -119,32 +114,30 @@ def eval_libero(args: Args) -> None:
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
 
-    reverie = None
-    first_chunk, later_chunk = args.first_chunk, args.later_chunk
-    aspect = None  # inference width/height; enables letterboxing when set
+    streamers = None
     if args.mode == "rerender":
-        reverie = ReverieClient(args.reverie_url, config=args.reverie_config)
-        info = reverie.info()
-        first_chunk, later_chunk = info["first_chunk_frames"], info["chunk_frames"]
-        if args.pad_aspect:
-            aspect = info["inference_width"] / info["inference_height"]
-        logging.info("Reverie server: N=%s first_chunk=%d later_chunk=%d inf=%dx%d pad_aspect=%s",
-                     info["N"], first_chunk, later_chunk,
-                     info["inference_height"], info["inference_width"], aspect)
+        streamers = rerender_loop.connect(
+            args.reverie_url, num_views=2, config=args.reverie_config)
+        m = streamers[0].meta
+        logging.info("Reverie server: N=%s first_chunk=%s later_chunk=%s inf=%sx%s",
+                     m["n"], m["first_chunk_frames"], m["later_chunk_frames"],
+                     m["inference_h"], m["inference_w"])
 
     chunked = args.mode in ("rerender", "raw_chunked")
+    rerenderer = None
+    if chunked:
+        # Views: [agentview, wrist].
+        rerenderer = rerender_loop.ChunkedRerenderer(
+            streamers, num_views=2, first_chunk=args.first_chunk,
+            later_chunk=args.later_chunk, pad_aspect=args.pad_aspect)
 
     # One fixed set of composed reverie prompts, shared by all tasks and
     # cycled across each task's episodes (episode e -> prompt e % num).
     reverie_prompts = [args.reverie_prompt]
     if args.prompt_templates:
-        prompt_bank = json.loads(pathlib.Path(args.prompt_templates).read_text())
-        prompt_rng = np.random.default_rng(args.seed)
-        template_keys = [k.strip() for k in args.prompt_template_keys.split(",") if k.strip()]
-        reverie_prompts = [
-            " ".join(str(prompt_rng.choice(prompt_bank[k])) for k in template_keys)
-            for _ in range(args.num_reverie_prompts)
-        ]
+        reverie_prompts = rerender_loop.compose_prompts(
+            args.prompt_templates, args.num_reverie_prompts, args.seed,
+            keys=args.prompt_template_keys)
         for i, p in enumerate(reverie_prompts):
             logging.info("Reverie prompt %d: %s", i, p)
 
@@ -164,14 +157,10 @@ def eval_libero(args: Args) -> None:
             obs = env.set_init_state(initial_states[episode_idx])
             action_plan = collections.deque()
 
-            if reverie is not None:
-                reverie.open_session(reverie_prompt, mode=args.reverie_mode,
-                                     seed=args.reverie_seed)
+            if rerenderer is not None:
+                rerenderer.start_episode(reverie_prompt, mode=args.reverie_mode,
+                                         seed=args.reverie_seed)
 
-            # Perception buffers (chunked modes).
-            buf_agent: list = []
-            buf_wrist: list = []
-            next_chunk = first_chunk
             last_img: Optional[np.ndarray] = None
             last_wrist: Optional[np.ndarray] = None
 
@@ -181,45 +170,38 @@ def eval_libero(args: Args) -> None:
             t, done = 0, False
             logging.info("Starting episode %d...", task_episodes + 1)
 
+            def observe():
+                """Upright native-res frames (180deg rotate = train preproc)."""
+                agent = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                return agent, wrist
+
             # Warmup: let physics settle and, in chunked modes, prime the
             # perception buffer with dummy-action steps so the policy's first
             # real observation is already a (re)rendered frame -- the policy
             # never acts on a raw sim frame during the first chunk.
             while t < args.num_steps_wait or (chunked and last_img is None):
-                agent = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                agent, wrist = observe()
                 if chunked:
-                    buf_agent.append(agent)
-                    buf_wrist.append(wrist)
-                    if len(buf_agent) == next_chunk:
-                        out_agent, out_wrist = _rerender_chunk(
-                            reverie, buf_agent, buf_wrist, aspect)
+                    out = rerenderer.add([agent, wrist])
+                    if out is not None:
                         if args.save_reverie_video:
-                            reverie_view.extend(out_agent)
-                        last_img = _resize224(out_agent[-1], args.resize_size)
-                        last_wrist = _resize224(out_wrist[-1], args.resize_size)
-                        buf_agent, buf_wrist = [], []
-                        next_chunk = later_chunk
+                            reverie_view.extend(out[0])
+                        last_img = _resize224(out[0][-1], args.resize_size)
+                        last_wrist = _resize224(out[1][-1], args.resize_size)
                 obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
                 t += 1
 
             while t < max_steps + args.num_steps_wait:
-                # Upright native-res frames (180deg rotate matches train preproc).
-                agent = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                agent, wrist = observe()
 
                 if chunked:
-                    buf_agent.append(agent)
-                    buf_wrist.append(wrist)
-                    if len(buf_agent) == next_chunk:
-                        out_agent, out_wrist = _rerender_chunk(
-                            reverie, buf_agent, buf_wrist, aspect)
+                    out = rerenderer.add([agent, wrist])
+                    if out is not None:
                         if args.save_reverie_video:
-                            reverie_view.extend(out_agent)
-                        last_img = _resize224(out_agent[-1], args.resize_size)
-                        last_wrist = _resize224(out_wrist[-1], args.resize_size)
-                        buf_agent, buf_wrist = [], []
-                        next_chunk = later_chunk
+                            reverie_view.extend(out[0])
+                        last_img = _resize224(out[0][-1], args.resize_size)
+                        last_wrist = _resize224(out[1][-1], args.resize_size)
                         # Force a replan on the freshly rerendered frame so the
                         # policy never executes a stale plan across a flush.
                         action_plan.clear()
@@ -277,47 +259,11 @@ def eval_libero(args: Args) -> None:
 
         logging.info("Task success rate: %.3f", task_successes / max(task_episodes, 1))
 
-    if reverie is not None:
-        reverie.close()
+    if rerenderer is not None:
+        rerenderer.close()
 
     logging.info("Total success rate: %.3f (%d episodes)",
                  total_successes / max(total_episodes, 1), total_episodes)
-
-
-def _rerender_chunk(reverie, buf_agent, buf_wrist, aspect=None):
-    """Return (agent_frames, wrist_frames) lists of native-res uint8 frames."""
-    if reverie is None:  # raw_chunked baseline: identity
-        return list(buf_agent), list(buf_wrist)
-    # [2, n, H, W, 3]: batch dim = [agentview, wrist].
-    batch = np.stack([np.stack(buf_agent, 0), np.stack(buf_wrist, 0)], axis=0)
-    crop = None
-    if aspect is not None:
-        batch, crop = _pad_to_aspect(batch, aspect)
-    out = reverie.process(batch)  # [2, n, H, W(padded), 3]
-    if crop is not None:
-        (h0, h1), (w0, w1) = crop
-        out = out[:, :, h0:h1, w0:w1, :]
-    return list(out[0]), list(out[1])
-
-
-def _pad_to_aspect(batch, aspect):
-    """Edge-pad [B,n,H,W,3] to width:height == aspect; return (batch, crop box)."""
-    _, _, H, W, _ = batch.shape
-    target_w = int(round(H * aspect))
-    if target_w > W:
-        pad = target_w - W
-        left = pad // 2
-        batch = np.pad(batch, ((0, 0), (0, 0), (0, 0), (left, pad - left), (0, 0)),
-                       mode="edge")
-        return batch, ((0, H), (left, left + W))
-    target_h = int(round(W / aspect))
-    if target_h > H:
-        pad = target_h - H
-        top = pad // 2
-        batch = np.pad(batch, ((0, 0), (0, 0), (top, pad - top), (0, 0), (0, 0)),
-                       mode="edge")
-        return batch, ((top, top + H), (0, W))
-    return batch, ((0, H), (0, W))
 
 
 def _get_libero_env(task, resolution, seed):
