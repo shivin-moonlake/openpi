@@ -186,7 +186,9 @@ def eval_libero(args: Args) -> None:
                     out = rerenderer.add([agent, wrist])
                     if out is not None:
                         if args.save_reverie_video:
-                            reverie_view.extend(out[0])
+                            # Full inference-res agentview generation (the
+                            # native `out` is downscaled back to 256px).
+                            reverie_view.extend(rerenderer.hires_chunk[0])
                         last_img = _resize224(out[0][-1], args.resize_size)
                         last_wrist = _resize224(out[1][-1], args.resize_size)
                 obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
@@ -199,7 +201,7 @@ def eval_libero(args: Args) -> None:
                     out = rerenderer.add([agent, wrist])
                     if out is not None:
                         if args.save_reverie_video:
-                            reverie_view.extend(out[0])
+                            reverie_view.extend(rerenderer.hires_chunk[0])
                         last_img = _resize224(out[0][-1], args.resize_size)
                         last_wrist = _resize224(out[1][-1], args.resize_size)
                         # Force a replan on the freshly rerendered frame so the
@@ -251,7 +253,7 @@ def eval_libero(args: Args) -> None:
             if args.save_reverie_video and reverie_view:
                 imageio.mimwrite(
                     pathlib.Path(args.video_out_path) / f"reverie_{seg}_{episode_idx}_{suffix}.mp4",
-                    [np.asarray(x) for x in reverie_view], fps=10)
+                    [np.asarray(x) for x in reverie_view], fps=10, quality=8)
 
             logging.info("Success: %s | episodes=%d successes=%d (%.1f%%)",
                          done, total_episodes, total_successes,
