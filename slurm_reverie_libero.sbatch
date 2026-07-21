@@ -48,7 +48,11 @@ REPLAN_STEPS="${REPLAN_STEPS:-}"               # blank -> sim default (5)
 ACTION_HORIZON="${ACTION_HORIZON:-}"           # blank -> model default (10 for pi05_libero)
 TASK_SUITE="${TASK_SUITE:-libero_spatial}"
 NUM_TRIALS="${NUM_TRIALS:-2}"                   # per task; raise for full runs
-MAX_TASKS="${MAX_TASKS:-1}"                     # cap tasks for a quick test
+# Task shard [TASK_START, TASK_END): submit several jobs with disjoint ranges
+# to run one suite in parallel, e.g. 4 shards 0-3/3-5/5-8/8-10 use all 8
+# stream-server GPUs (2 leases each). Blank TASK_END = through the last task.
+TASK_START="${TASK_START:-0}"
+TASK_END="${TASK_END:-1}"                       # default: 1 task for a quick test
 REVERIE_PROMPT="${REVERIE_PROMPT:-A robotic arm with segmented joints and a gripper moves above a tabletop workspace on a bright sunny day, with warm sunlight casting soft highlights and long shadows.}"
 # Optional JSON prompt bank (env/robot/table/light fragments) -> 10 prompts
 # are composed once and cycled across every task's episodes (50 trials =
@@ -65,7 +69,7 @@ IFS=',' read -ra _ALLOC_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1}"
 G_POLICY="${_ALLOC_GPUS[0]:-0}"
 G_SIM="${_ALLOC_GPUS[1]:-${G_POLICY}}"
 
-echo "=== Node: $(hostname) | mode=$MODE suite=$TASK_SUITE trials=$NUM_TRIALS tasks=$MAX_TASKS policy_port=$POLICY_PORT reverie_url=$REVERIE_URL gpus=[$G_POLICY,$G_SIM] ==="
+echo "=== Node: $(hostname) | mode=$MODE suite=$TASK_SUITE trials=$NUM_TRIALS tasks=[$TASK_START,${TASK_END:-end}) policy_port=$POLICY_PORT reverie_url=$REVERIE_URL gpus=[$G_POLICY,$G_SIM] ==="
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 
 wait_for_port() {  # host port timeout_s
@@ -119,18 +123,18 @@ wait_for_port 127.0.0.1 "$POLICY_PORT" 600
 # --- GPU1: LIBERO sim + eval ---
 echo "=== Running LIBERO sim (GPU$G_SIM) mode=$MODE ==="
 cd "$OPENPI_ROOT"
-MAX_TASKS_ARG=""
-[[ -n "$MAX_TASKS" ]] && MAX_TASKS_ARG="--max-tasks $MAX_TASKS"
+TASK_ARGS="--task-start $TASK_START"
+[[ -n "$TASK_END" ]] && TASK_ARGS="$TASK_ARGS --task-end $TASK_END"
 REPLAN_ARG=""
 [[ -n "$REPLAN_STEPS" ]] && REPLAN_ARG="--replan-steps $REPLAN_STEPS"
-VIDEO_OUT="data/libero/videos_reverie/${MODE}_N${REVERIE_N}_m${REVERIE_FPS_MULT}_r${REPLAN_STEPS:-d}_h${ACTION_HORIZON:-d}_job${SLURM_JOB_ID}"
+VIDEO_OUT="data/libero/videos_reverie/${MODE}_N${REVERIE_N}_m${REVERIE_FPS_MULT}_r${REPLAN_STEPS:-d}_h${ACTION_HORIZON:-d}_t${TASK_START}-${TASK_END:-end}_job${SLURM_JOB_ID}"
 eval MUJOCO_EGL_DEVICE_ID=$G_SIM ./run_libero_eval.sh reverie-sim \
   --host 127.0.0.1 --port "$POLICY_PORT" \
   --task-suite-name "$TASK_SUITE" \
   --num-trials-per-task "$NUM_TRIALS" \
   --video-out-path "$VIDEO_OUT" \
   $REPLAN_ARG \
-  $MAX_TASKS_ARG \
+  $TASK_ARGS \
   $REVERIE_ARGS
 
 echo "=== Done. Videos in $OPENPI_ROOT/$VIDEO_OUT ==="

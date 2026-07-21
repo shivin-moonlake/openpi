@@ -87,7 +87,11 @@ class Args:
     task_suite_name: str = "libero_spatial"
     num_steps_wait: int = 10
     num_trials_per_task: int = 50
-    max_tasks: Optional[int] = None  # cap tasks for quick tests
+    # Task shard [task_start, task_end): submit several jobs with disjoint
+    # ranges to run one suite in parallel (each job leases its own stream-
+    # server GPUs). task_end=None runs through the last task.
+    task_start: int = 0
+    task_end: Optional[int] = None
 
     video_out_path: str = "data/libero/videos_reverie"
     save_reverie_video: bool = True
@@ -162,10 +166,10 @@ def eval_libero(args: Args) -> None:
 
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
-    num_tasks_in_suite = task_suite.n_tasks
-    if args.max_tasks is not None:
-        num_tasks_in_suite = min(num_tasks_in_suite, args.max_tasks)
-    logging.info("Task suite: %s (%d tasks)", args.task_suite_name, num_tasks_in_suite)
+    task_end = task_suite.n_tasks if args.task_end is None else min(args.task_end, task_suite.n_tasks)
+    assert 0 <= args.task_start < task_end, (args.task_start, task_end)
+    logging.info("Task suite: %s (tasks [%d, %d) of %d)",
+                 args.task_suite_name, args.task_start, task_end, task_suite.n_tasks)
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
 
@@ -204,7 +208,7 @@ def eval_libero(args: Args) -> None:
             logging.info("Reverie prompt %d: %s", i, p)
 
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    for task_id in tqdm.tqdm(range(args.task_start, task_end)):
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
