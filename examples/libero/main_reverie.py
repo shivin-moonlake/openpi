@@ -76,6 +76,12 @@ class Args:
     # Chunk sizes (only used by raw_chunked; rerender reads them from /info).
     first_chunk: int = 9
     later_chunk: int = 12
+    # Render the cameras at 20*mult fps: (mult - 1) extra TRUE frames are
+    # rendered inside each env.step's physics substep loop and fed to Reverie,
+    # so chunks fill mult-x faster and the policy gets a fresh rerendered
+    # frame every later_chunk/mult steps instead of every later_chunk. Sim
+    # dynamics and the 20Hz policy cadence are untouched.
+    reverie_fps_mult: int = 1
 
     # LIBERO
     task_suite_name: str = "libero_spatial"
@@ -90,6 +96,62 @@ class Args:
 
 def _resize224(frame_u8: np.ndarray, size: int) -> np.ndarray:
     return image_tools.convert_to_uint8(image_tools.resize_with_pad(frame_u8, size, size))
+
+
+def _step_with_midstep_renders(env, action, mult):
+    """LIBERO env.step with (mult - 1) evenly spaced TRUE camera renders inside
+    the physics substep loop -> 20*mult fps perception, unchanged 20Hz
+    dynamics/policy cadence.
+
+    Reimplements the two step() layers this replaces (pinned versions):
+    robosuite base.Environment.step (substep loop) and LIBERO
+    bddl_base_domain.step (OSC_POSITION conversion + done=_check_success).
+    Returns (obs, reward, done, info, mids); mids are (agentview, wrist)
+    frames in the same convention as obs["agentview_image"].
+    """
+    if mult <= 1:
+        obs, reward, done, info = env.step(action)
+        return obs, reward, done, info, []
+
+    import robosuite.utils.macros as macros
+    import robosuite.utils.mjcf_utils as mjcf_utils
+
+    raw = env.env  # OffScreenRenderEnv/ControlEnv -> robosuite env
+    assert not raw.done, "executing action in terminated episode"
+    if raw.action_dim == 4 and len(action) > 4:
+        action = np.concatenate((np.asarray(action)[:3], np.asarray(action)[-1:]), axis=-1)
+
+    conv = mjcf_utils.IMAGE_CONVENTION_MAPPING[macros.IMAGE_CONVENTION]
+
+    def render_cams():
+        agent = raw.sim.render(camera_name="agentview",
+                               width=LIBERO_ENV_RESOLUTION,
+                               height=LIBERO_ENV_RESOLUTION)[::conv]
+        wrist = raw.sim.render(camera_name="robot0_eye_in_hand",
+                               width=LIBERO_ENV_RESOLUTION,
+                               height=LIBERO_ENV_RESOLUTION)[::conv]
+        return agent, wrist
+
+    raw.timestep += 1
+    n_substeps = int(raw.control_timestep / raw.model_timestep)
+    # Substeps after which to grab an intermediate frame (the step's final
+    # state is rendered by the caller's next observe()).
+    render_at = {int(round(n_substeps * k / mult)) for k in range(1, mult)}
+    mids = []
+    policy_step = True
+    for i in range(n_substeps):
+        raw.sim.forward()
+        raw._pre_action(action, policy_step)
+        raw.sim.step()
+        raw._update_observables()
+        policy_step = False
+        if (i + 1) in render_at:
+            mids.append(render_cams())
+    raw.cur_time += raw.control_timestep
+    reward, done, info = raw._post_action(action)
+    done = raw._check_success()
+    obs = raw.viewer._get_observations() if raw.viewer_get_obs else raw._get_observations()
+    return obs, reward, done, info, mids
 
 
 def eval_libero(args: Args) -> None:
@@ -176,6 +238,30 @@ def eval_libero(args: Args) -> None:
                 wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
                 return agent, wrist
 
+            def feed(agent, wrist):
+                """Buffer one frame; on a chunk flush, refresh the policy's
+                rerendered views. Returns True if a flush happened."""
+                nonlocal last_img, last_wrist
+                out = rerenderer.add([agent, wrist])
+                if out is None:
+                    return False
+                if args.save_reverie_video:
+                    # Full inference-res agentview generation (the
+                    # native `out` is downscaled back to 256px).
+                    reverie_view.extend(rerenderer.hires_chunk[0])
+                last_img = _resize224(out[0][-1], args.resize_size)
+                last_wrist = _resize224(out[1][-1], args.resize_size)
+                return True
+
+            def feed_mids(mids):
+                """Feed the true mid-step frames rendered inside env.step
+                (same 180deg rotate as observe()). Returns True on a flush."""
+                flushed = False
+                for m_agent, m_wrist in mids:
+                    flushed |= feed(np.ascontiguousarray(m_agent[::-1, ::-1]),
+                                    np.ascontiguousarray(m_wrist[::-1, ::-1]))
+                return flushed
+
             # Warmup: let physics settle and, in chunked modes, prime the
             # perception buffer with dummy-action steps so the policy's first
             # real observation is already a (re)rendered frame -- the policy
@@ -183,30 +269,20 @@ def eval_libero(args: Args) -> None:
             while t < args.num_steps_wait or (chunked and last_img is None):
                 agent, wrist = observe()
                 if chunked:
-                    out = rerenderer.add([agent, wrist])
-                    if out is not None:
-                        if args.save_reverie_video:
-                            # Full inference-res agentview generation (the
-                            # native `out` is downscaled back to 256px).
-                            reverie_view.extend(rerenderer.hires_chunk[0])
-                        last_img = _resize224(out[0][-1], args.resize_size)
-                        last_wrist = _resize224(out[1][-1], args.resize_size)
-                obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                    feed(agent, wrist)
+                obs, reward, done, info, mids = _step_with_midstep_renders(
+                    env, LIBERO_DUMMY_ACTION, args.reverie_fps_mult if chunked else 1)
+                if chunked:
+                    feed_mids(mids)
                 t += 1
 
             while t < max_steps + args.num_steps_wait:
                 agent, wrist = observe()
 
-                if chunked:
-                    out = rerenderer.add([agent, wrist])
-                    if out is not None:
-                        if args.save_reverie_video:
-                            reverie_view.extend(rerenderer.hires_chunk[0])
-                        last_img = _resize224(out[0][-1], args.resize_size)
-                        last_wrist = _resize224(out[1][-1], args.resize_size)
-                        # Force a replan on the freshly rerendered frame so the
-                        # policy never executes a stale plan across a flush.
-                        action_plan.clear()
+                if chunked and feed(agent, wrist):
+                    # Force a replan on the freshly rerendered frame so the
+                    # policy never executes a stale plan across a flush.
+                    action_plan.clear()
 
                 if last_img is not None:
                     img224, wrist224 = last_img, last_wrist
@@ -235,7 +311,10 @@ def eval_libero(args: Args) -> None:
                     action_plan.extend(action_chunk[: args.replan_steps])
 
                 action = action_plan.popleft()
-                obs, reward, done, info = env.step(action.tolist())
+                obs, reward, done, info, mids = _step_with_midstep_renders(
+                    env, action.tolist(), args.reverie_fps_mult if chunked else 1)
+                if chunked and feed_mids(mids):
+                    action_plan.clear()
                 if done:
                     task_successes += 1
                     total_successes += 1

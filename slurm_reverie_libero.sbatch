@@ -40,6 +40,10 @@ REVERIE_URL="${REVERIE_URL:-ws://gmicloud-loki-g1-gpu-001:8422/api}"
 # whatever the server has resident, default dual_dmd_cf_optimized).
 REVERIE_CONFIG="${REVERIE_CONFIG:-}"
 REVERIE_N="${REVERIE_N:-3}"                     # 3 (chunks 9->12) | 1 (chunks 1->4); must match the server config's N
+# Render the cameras at 20*mult fps (true extra frames from inside the
+# physics substep loop): chunks flush mult-x more often, halving perception
+# staleness at 2. Sim dynamics and policy cadence stay 20Hz.
+REVERIE_FPS_MULT="${REVERIE_FPS_MULT:-1}"
 REPLAN_STEPS="${REPLAN_STEPS:-}"               # blank -> sim default (5)
 ACTION_HORIZON="${ACTION_HORIZON:-}"           # blank -> model default (10 for pi05_libero)
 TASK_SUITE="${TASK_SUITE:-libero_spatial}"
@@ -101,7 +105,7 @@ FIRST_CHUNK=$(( 1 + 4 * (REVERIE_N - 1) ))
 LATER_CHUNK=$(( 4 * REVERIE_N ))
 
 if [[ "$MODE" == "rerender" ]]; then
-  REVERIE_ARGS="--mode rerender --reverie-url $REVERIE_URL --reverie-mode $REVERIE_STREAM_MODE --reverie-prompt \"$REVERIE_PROMPT\""
+  REVERIE_ARGS="--mode rerender --reverie-url $REVERIE_URL --reverie-mode $REVERIE_STREAM_MODE --reverie-prompt \"$REVERIE_PROMPT\" --reverie-fps-mult $REVERIE_FPS_MULT"
   [[ -n "$REVERIE_CONFIG" ]] && REVERIE_ARGS="$REVERIE_ARGS --reverie-config \"$REVERIE_CONFIG\""
   [[ -n "$PROMPT_TEMPLATES" ]] && REVERIE_ARGS="$REVERIE_ARGS --prompt-templates \"$PROMPT_TEMPLATES\""
 elif [[ "$MODE" == "raw_chunked" ]]; then
@@ -119,7 +123,7 @@ MAX_TASKS_ARG=""
 [[ -n "$MAX_TASKS" ]] && MAX_TASKS_ARG="--max-tasks $MAX_TASKS"
 REPLAN_ARG=""
 [[ -n "$REPLAN_STEPS" ]] && REPLAN_ARG="--replan-steps $REPLAN_STEPS"
-VIDEO_OUT="data/libero/videos_reverie/${MODE}_N${REVERIE_N}_r${REPLAN_STEPS:-d}_h${ACTION_HORIZON:-d}_job${SLURM_JOB_ID}"
+VIDEO_OUT="data/libero/videos_reverie/${MODE}_N${REVERIE_N}_m${REVERIE_FPS_MULT}_r${REPLAN_STEPS:-d}_h${ACTION_HORIZON:-d}_job${SLURM_JOB_ID}"
 eval MUJOCO_EGL_DEVICE_ID=$G_SIM ./run_libero_eval.sh reverie-sim \
   --host 127.0.0.1 --port "$POLICY_PORT" \
   --task-suite-name "$TASK_SUITE" \
